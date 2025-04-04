@@ -38,12 +38,17 @@ class Rescaler:
             
             params = self.scaler[var_name]
             min_val, max_val = float(params['min']), float(params['max'])
+            was_log_scaled = params.get('was_log_scaled', False)
             print(var_name, min_val, max_val)
             scaled_values = data_array[:, idx, :, :].astype(float)
 
             # Step 1: Inverse MinMax scaling
             rescaled_values = (scaled_values * (max_val - min_val)) + min_val
 
+            if was_log_scaled:
+                rescaled_values = np.exp(rescaled_values)
+                rescaled_values = np.clip(rescaled_values, 0, None)
+                
             # Handle missing values (replace -1.0 with NaN)
             rescaled_values[scaled_values == -1.0] = np.nan
 
