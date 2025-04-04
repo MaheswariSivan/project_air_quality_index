@@ -33,14 +33,14 @@ class Rescaler:
         rescaled_data = {}
 
         for var_name, idx in var_dict.items():
-            if var_name not in self.scaler or idx >= data_array.shape[1]:
+            if var_name not in self.scaler:
                 continue
             
             params = self.scaler[var_name]
             min_val, max_val = float(params['min']), float(params['max'])
             was_log_scaled = params.get('was_log_scaled', False)
             print(var_name, min_val, max_val)
-            scaled_values = data_array[:, idx, :, :].astype(float)
+            scaled_values = data_array[var_name].to_numpy().astype(float)
 
             # Step 1: Inverse MinMax scaling
             rescaled_values = (scaled_values * (max_val - min_val)) + min_val
@@ -48,7 +48,7 @@ class Rescaler:
             if was_log_scaled:
                 rescaled_values = np.exp(rescaled_values)
                 rescaled_values = np.clip(rescaled_values, 0, None)
-                
+
             # Handle missing values (replace -1.0 with NaN)
             rescaled_values[scaled_values == -1.0] = np.nan
 
@@ -59,7 +59,7 @@ class Rescaler:
         coords={
             'latitude': og_data['latitude'].values,
             'longitude': og_data['longitude'].values,
-            'new_time': og_data['time'].isel(time=time_indices).values  # Use temporary dim
+            'new_time': og_data['time'].values  # Use temporary dim
         }
         )
         
@@ -159,7 +159,7 @@ class EAQICalculator:
         
         # Create coordinates
         coords = {
-            'time': reference_ds['time'].isel(time=time_indices).values,
+            'time': reference_ds['time'].values,
             'latitude': reference_ds['latitude'].values,
             'longitude': reference_ds['longitude'].values
         }
@@ -182,29 +182,115 @@ class EAQICalculator:
         
         return ds
 
-def load_and_prepare_data(data_path):
-    """Load and prepare input data"""
-    ds = xr.open_dataset(data_path, engine='netcdf4')
-    variables = list(ds.data_vars)
-    ten_data = torch.stack([torch.tensor(ds[var].values, dtype=torch.float32) 
-                           for var in variables], dim=1)
-    return ds, ten_data
+class PredictionSaver:
+    def __init__(self, model_path: str):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = self._load_model(model_path)
+        
+    def _load_model(self, model_path: str):
+        """Load trained model weights"""
+        trainer = create_aqi_model.WeatherModelTrainer.load(model_path)
+        trainer.model.eval()
+        return trainer.model
+        
+    def save_predictions(self, input_path: str, output_path: str, target_time):
+        """
+        Save raw model predictions for specified hour
+        
+        Args:
+            input_path: Path to input NetCDF
+            output_path: Where to save predictions
+            target_time: Exact hour to predict (datetime object)
+        """
+        # 1. Load and prepare data
+        ds = xr.open_dataset(input_path)
+        target_idx = self.find_time_index(ds, target_time)
+        
+        # 2. Run prediction
+        raw_pred = self._run_prediction(ds, target_idx)
+        
+        # 3. Save raw outputs
+        return self._save_raw_output(raw_pred, ds, output_path, target_time), target_idx
+    
+    def find_time_index(self, ds, target_time):
+        """Find array index for specified hour with enhanced time matching"""
+        time_np64 = ds.time.to_numpy().astype("datetime64[ns]")
+        target_time = np.datetime64(target_time)
+        index = np.where(time_np64 == target_time)[0]
+        print(index)
+        index = index.item()
+        return index
+    
+    def _run_prediction(self, ds: xr.Dataset, target_index) -> torch.Tensor:
+        """Execute model prediction"""
+        # Validate input index
+        if target_index < 8 or target_index >= len(ds.time):
+            raise ValueError(
+                f"Target index {target_index} is out of bounds for temporal window. "
+                f"Must be between 8 and {len(ds.time)-1}"
+            )
 
-def prepare_model_inputs(tensor_data):
-    """Prepare spatial and temporal model inputs"""
-    spatial_data = tensor_data[-1].unsqueeze(0)  # Add batch dim
-    temporal_window = tensor_data[-8:]  # Last 8 timesteps
-    temporal_data = temporal_window.permute(1,0,2,3).flatten(2).unsqueeze(0)
-    return spatial_data, temporal_data
-
-def run_model_prediction(model, spatial_input, temporal_input, device):
-    """Execute model prediction"""
-    model.eval()
-    with torch.no_grad():
-        return model(
-            spatial_input.to(device),
-            temporal_input.to(device)
-        ).cpu()
+        # Convert all variables to tensor stack [time, vars, lat, lon]
+        variables = list(ds.data_vars)
+        tensor_data = torch.stack(
+            [torch.tensor(ds[var].values, dtype=torch.float32) for var in variables],
+            dim=1
+        )
+        
+        # Prepare model inputs
+        spatial_input = tensor_data[target_index].unsqueeze(0).to(self.device)  # (1, vars, lat, lon)
+        print(spatial_input.shape)
+        # Extract 8-hour window before target (including target-8 to target-1)
+        temporal_window = tensor_data[target_index-8:target_index]  # (8, vars, lat, lon)
+        temporal_input = temporal_window.permute(1, 0, 2, 3)  # (vars, 8, lat, lon)
+        temporal_input = temporal_input.flatten(2)  # (vars, 8*lat*lon)
+        temporal_input = temporal_input.unsqueeze(0).to(self.device)  # (1, vars, 8*lat*lon)
+        print(temporal_input.shape)
+        
+        # Run prediction
+        with torch.no_grad():
+            predictions = self.model(spatial_input, temporal_input)
+        print(predictions.shape)
+        return predictions.cpu()
+    
+    def _save_raw_output(self, pred: torch.Tensor, reference_ds: xr.Dataset, output_path: str, target_time):
+        """Save raw predictions with coordinates"""
+        # Convert predictions to numpy array
+        pred_np = pred.numpy() # shape ( t, n_vars, lat, lon)
+        
+        # Get variable names from reference dataset
+        variables = list(reference_ds.data_vars.keys())
+        
+        # Create a dictionary for all predicted variables
+        data_vars = {}
+        for var_idx, var_name in enumerate(variables):
+            # Store prediction with original dimensions (time, lat, lon)
+            data_vars[f"{var_name}"] = (
+                ["time", "latitude", "longitude"], 
+                pred_np[:, var_idx, :, :]  # Select all times for this variable
+            )
+        
+        # Create output dataset with proper coordinates
+        output_ds = xr.Dataset(
+            data_vars,
+            coords={
+                "new_time": [np.datetime64(target_time)],
+                "latitude": reference_ds.latitude,
+                "longitude": reference_ds.longitude,
+            }
+        )
+        output_ds = output_ds.rename({'new_time': 'time'})
+        # Add global attributes
+        output_ds.attrs.update({
+            "source": "AQI Model Predictions",
+            "target_time": str(target_time)
+        })
+        # Preserve variable attributes from original dataset
+        for var_name in variables:
+            if hasattr(reference_ds[var_name], 'attrs'):
+                output_ds[f"{var_name}"].attrs.update(reference_ds[var_name].attrs)
+        
+        return output_ds
 
 def visualize_results(aqi_data, output_path):
     """Generate EAQI visualization plot"""
@@ -237,37 +323,38 @@ def visualize_results(aqi_data, output_path):
 
 def main():
     # Configuration
-    DATA_PATH = 'complete_data_aqi_log.nc'
-    MODEL_PATH = 'aqi_model_v2.pth'
     SCALER_PATH = 'weather_data_aqi_log.save'
     OUTPUT_IMAGE = 'eaqi_prediction.png'
     
     # Device setup
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Load data
-    ds, ten_data = load_and_prepare_data(DATA_PATH)
+    config = {
+        "input_path": "complete_data_aqi_log.nc",
+        "output_path": "raw_predictions_log.nc",
+        "model_path": "aqi_model_v2.pth",
+        "target_time": "2023-03-17T03:00:00.000000000"
+    }
     
-    # Prepare model inputs
-    spatial_input, temporal_input = prepare_model_inputs(ten_data)
+    # Run prediction pipeline
+    saver = PredictionSaver(config["model_path"])
+    raw_outputs, target_idx = saver.save_predictions(
+        config["input_path"],
+        config["output_path"],
+        config["target_time"]
+        )
     
-    # Load and run model
-    trainer = create_aqi_model.WeatherModelTrainer.load(MODEL_PATH)
-    raw_outputs = run_model_prediction(
-        trainer.model, spatial_input, temporal_input, device)
-    
-    raw_outputs = raw_outputs.cpu().numpy()
     # Rescale outputs
     var_dict = {'co_conc':0, 'o3_conc':1, 'pm10_conc':2, 'pm2p5_conc':3, 'so2_conc':4, 'no2_conc':5}
     rescaler = Rescaler(SCALER_PATH)
-    rescaler = rescaler.rescale_xarray( raw_outputs, var_dict, -1, ds)
+    rescaler = rescaler.rescale_xarray( raw_outputs, var_dict, -1, raw_outputs)
     
     # Calculate EAQI
     aqi_data = EAQICalculator.create_eaqi_dataset(
         rescaler,
         pollutant_dict=var_dict,
-        time_indices=slice(-1, None),  # Last timestep
-        reference_ds=ds
+        time_indices=target_idx, 
+        reference_ds=raw_outputs
     )
     
     # Visualize and save results
