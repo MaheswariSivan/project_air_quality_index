@@ -29,7 +29,7 @@ class WeatherDataPreprocessor:
         return dataset_time_lat_long.sortby('longitude')
     
 
-    def minmax_scale(self, dataset):
+    def minmax_scale(self, dataset, log_transform_vars=None, epsilon=1e-6):
         """
         Apply MinMax scaling.
     
@@ -39,48 +39,47 @@ class WeatherDataPreprocessor:
         Returns:
             Scaled xarray Dataset
         """
+        if log_transform_vars is None:
+            log_transform_vars = ['so2_conc', 'no2_conc', 'o3_conc', 'pm10_conc', 'pm2p5_conc',]
+
         scaled_vars = {}
-        
+
         for var in dataset.data_vars:
-            
-            # Get original values
             values = dataset[var].values.copy()
             original_shape = values.shape
+
+            # Optional unit conversions
             if var == 'co_conc':
-                values = values * (24.45/28010) # converting from µg/m³ to ppm
+                values *= (24.45 / 28010)
             elif var == 'no2_conc':
-                values = values * (24.45/46.005) # converting from µg/m³ to ppb
+                values *= (24.45 / 46.005)
             elif var == 'so2_conc':
-                values = values * (24.45/64.06) # converting from µg/m³ to ppb
+                values *= (24.45 / 64.06)
             elif var == 'o3_conc':
-                values = values * (24.45/48) # converting from µg/m³ to ppb
+                values *= (24.45 / 48)
 
+            was_log_scaled = False
+            if var in log_transform_vars:
+                values = np.clip(values, epsilon, None)
+                values = np.log(values)
+                was_log_scaled = True
 
-            # MinMax scaling
-            scaled_values = self.scaler.fit_transform(values.reshape(-1, 1))
-            scaled_values = scaled_values.reshape(original_shape)
-            
-            # Store scaling parameters
-            self.scaler_params[var] = ({
-                'min': values.min(),  # Typically 0
-                'max': values.max(),   # Typically 1
-                'scale': self.scaler.scale_[0]
-            })
-            
+            # Apply MinMax scaling
+            scaled_values = self.scaler.fit_transform(values.reshape(-1, 1)).reshape(original_shape)
+
+            # Store scaling metadata
+            self.scaler_params[var] = {
+                'min': float(values.min()),
+                'max': float(values.max()),
+                'scale': float(self.scaler.scale_[0]),
+                'was_log_scaled': was_log_scaled,
+                'epsilon': epsilon if was_log_scaled else None
+            }
+
             scaled_vars[var] = (dataset[var].dims, scaled_values)
-    
+
         return xr.Dataset(scaled_vars, coords=dataset.coords)
 
-    def inverse_scale(self, var_name, scaled_data):
-        """Inverse transform scaled data for a specific variable"""
-        if var_name not in self.scaler_params:
-            raise ValueError(f"No scaler found for variable: {var_name}")
-        
-        params = self.scaler_params[var_name]
-        inverse_scaled = scaled_data * (params['max'] - params['min']) + params['min']
-        
-        
-        return inverse_scaled
     
     def save_scalers(self, filepath):
         """Save all scalers to disk"""
@@ -175,7 +174,7 @@ def main():
     combined = processor.remove_nan(combined) 
 
     combined = processor.minmax_scale(combined)
-    processor.save_scalers("weather_data_aqi.save")
+    processor.save_scalers("weather_data_aqi_log.save")
     
     
     combined = combined.drop_vars(['expver', 'number', 'valid_time'])
@@ -187,4 +186,4 @@ def main():
 if __name__ == '__main__':
     weather_xarray, _ = main()
 
-    weather_xarray.to_netcdf('complete_data_aqi.nc', format="NETCDF4")
+    weather_xarray.to_netcdf('complete_data_aqi_log.nc', format="NETCDF4")

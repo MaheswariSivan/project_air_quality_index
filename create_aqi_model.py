@@ -482,7 +482,7 @@ if __name__ == '__main__':
     """this block is executed only when we run this particular file. The remaining can be separately imported and used."""
     # Data preparation
     data_config = {
-        'data_path': "complete_data_aqi.nc",
+        'data_path': "complete_data_aqi_log.nc",
         'input_vars': 8,
         'target_vars':8,
         'batch_size':8
