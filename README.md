@@ -30,7 +30,7 @@ Output:
  - A cleaned and merged xarray Dataset with 3 core coordinates (time, latitude, longitude) and 8 selected variables, converted to a scaled NetCDF4 file.
  - Saved scaling metadata for later use
 
-## Model Creation and Architecture
+## Model Creation and Architecture: (*creat_aqi_model.py*)
 In this stage, a deep learning model is constructed to learn from the spatiotemporal structure of the environmental data prepared in the previous step. The model is designed to process input data that has both spatial dependencies (e.g., how pollutants vary across geographical regions) and temporal patterns (e.g., how pollution changes over time).
 
 The raw data is first converted from a NetCDF4 format into an xarray.Dataset, then transformed into a 4D PyTorch tensor of shape [time, variables, latitude, longitude]. The model inputs are split into two types:
@@ -57,7 +57,7 @@ Inputs:
 Output:
  - aqi_model_v2.pth: (If resuming) Previously saved model checkpoint.
 
-## Auto-Regressive Evaluation (Self-Feeding Model Predictions)
+## Auto-Regressive Evaluation (Self-Feeding Model Predictions) : (*model_check.py*)
 
 In this part, the goal is to assess how well the model performs when it relies on its own past predictions rather than ground truth data—a process known as auto-regressive evaluation. A random time step is chosen, and the model is initially given one spatial frame along with a sequence of temporal inputs representing previous conditions. It predicts the next time step, then uses that prediction as part of the input for the following step, repeating this for several iterations. Throughout this loop, the model's predictions and the corresponding ground truth targets are collected. To convert the model’s normalized outputs into interpretable physical values, an inverse transformation is applied using a previously saved Rescaler. The rescaled outputs and actual values are then saved as NetCDF files, and a comparison visualization is generated to visually evaluate model performance over time.
 
@@ -71,7 +71,7 @@ Outputs:
  - rescaled_tar.nc: NetCDF file of actual target values for comparison.
  - so2_conc_comparison.png: Side-by-side visual map of predicted vs actual SO₂ concentrations over time (the variable can be changed).
 
-## EAQI Caluclation and visualization
+## EAQI Caluclation and visualization: (*aqi_pred_calculation.py*)
 
 In the final stage, the output from the trained AQI model is used to compute the European Air Quality Index (EAQI) using standardized EU guidelines. First, the model’s raw predictions are loaded and rescaled back to their original concentration units using saved normalization parameters. Each pollutant’s concentration is then mapped to a standardized EAQI scale through breakpoint-based interpolation. The EAQI is calculated separately for all pollutants: PM2.5, PM10, NO₂, SO₂, CO, and O₃. These values are stored in an xarray dataset alongside the raw concentrations, and the overall EAQI is determined as the maximum index across all pollutants for each location and time step. Finally, a color-coded map visualizing the EAQI is generated and saved for interpretation and reporting.
 
