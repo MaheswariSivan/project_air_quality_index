@@ -95,11 +95,10 @@ class WeatherDataPreprocessor:
     
     def remove_nan(self, dataset):
         """
-        1. Temporal interpolation (along time dimension).
-        2. 2D spatial interpolation (latitude-longitude grid).
-        3. Fallback filling for remaining NaNs.
+        1. 2D spatial interpolation (latitude-longitude grid).
+        2. Fallback filling for remaining NaNs.
         """
-        # Step 1: Temporal interpolation
+        # Spatial interpolation
         dataset = dataset.interpolate_na(
         dim="latitude",
         method="linear"
@@ -107,21 +106,7 @@ class WeatherDataPreprocessor:
         dim="longitude",
         method="linear"
             )
-        
-        def get_mode(dataset, var_name):
-            """Get mode of a variable in an xarray Dataset"""
-            values = dataset[var_name].values.flatten()  # Flatten to 1D array
-            valid_values = values[~np.isnan(values)]     # Remove NaN values
-            unique, counts = np.unique(valid_values, return_counts=True)
-            return unique[np.argmax(counts)]
-        
-        # 3. Mode imputation
-        for var in dataset.data_vars:
-            # Get mode for each variable
-            var_mode = get_mode(dataset, var)
-            if not np.isnan(var_mode):  # Only fill if mode exists
-                dataset[var] = dataset[var].fillna(var_mode)
-            #  Step 4: Final fill 
+
         return dataset.fillna(-1.0)
 
     def open_read(self, path):
